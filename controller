@@ -1,0 +1,304 @@
+package edu.usfca.cs.dfs;
+
+import com.google.protobuf.ByteString;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.UnknownHostException;
+import java.security.NoSuchAlgorithmException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class Controller{
+
+    private ServerSocket ctlrServer;
+    private static String fileName;
+    private static int replica;
+    private static final String[] activities = {"storing","retrieving","safemode"};
+    private static Map<String,Integer> storageNodeList = new ConcurrentHashMap<>();  //storageNodeName, port
+    private static Map<String,List<String>> storageNodeChunkReport = new HashMap<>(); //storageNodeName, List of all chunks
+    private static Map<String,Long> storageNodeFreeSpace = new HashMap<>(); //storageNodeName, Free Space
+    private static Map<String, Date> activeNodes = new ConcurrentHashMap<>(); //active or not
+    private static Map<String,Integer> chunkNo = new HashMap<>();
+
+
+    public static void main(String[] args)
+            throws Exception {
+        String hostname = getHostname();
+        System.out.println("Starting Controller");
+        System.out.println("Controller hostname is " + hostname);
+        new Controller().start();
+    }
+
+    public void start() {
+        try {
+            ctlrServer = new ServerSocket(28000);
+            System.out.println("listening....");
+            Socket socket = null;
+            detectNodeFailure(socket);
+            while (true) {
+                socket = ctlrServer.accept();
+                ControllerMessages.ControllerMessageWrapper controllerMessageWrapper =
+                        ControllerMessages.ControllerMessageWrapper.parseDelimitedFrom(socket.getInputStream());
+                   // System.out.print(controllerMessageWrapper);
+                if(controllerMessageWrapper!=null) {
+                    if (controllerMessageWrapper.hasStorageReqMsg()) {
+                        ControllerMessages.StorageRequest storageRequest = controllerMessageWrapper.getStorageReqMsg();
+                        fileName = storageRequest.getFileName();
+                        chunkNo.put(storageRequest.getFileName(),storageRequest.getChunkNo());
+                        replica = storageRequest.getReplica();
+                        connectToClient(socket, activities[0]);
+                    } else if (controllerMessageWrapper.hasRetrieveReqMsg()) {
+                        ControllerMessages.RetrieveRequest retrieveRequest = controllerMessageWrapper.getRetrieveReqMsg();
+                        fileName = retrieveRequest.getFileName();
+                        connectToClient(socket, activities[1]);
+                    } else if (controllerMessageWrapper.hasHeartBeatMsg()) {
+                        ControllerMessages.HeartBeat heartBeat = controllerMessageWrapper.getHeartBeatMsg();
+                        getHeartBeat(heartBeat);
+                        connectToClient(socket, activities[2]);
+                    } else if(controllerMessageWrapper.hasChunkFailureMsg()){
+                        ControllerMessages.ChunkFailure chunkFailure = controllerMessageWrapper.getChunkFailureMsg();
+                        maintainReplica(socket,chunkFailure.getChunkNameList());
+                    }
+                }
+            }
+
+        }catch (Exception e){
+            e.printStackTrace();
+        }
+    }
+
+    public void connectToClient(Socket socket, String activity) throws IOException {
+        ControllerMessages.ControllerMessageWrapper controllerMessageWrapper = null;
+        if(activity.toLowerCase().equals(activities[0])){
+         controllerMessageWrapper =  createMessage(activities[0]);
+        }
+        else if(activity.toLowerCase().equals(activities[1])){
+          controllerMessageWrapper =  createMessage(activities[1]);
+        }
+        else if(activity.equalsIgnoreCase(activities[2])){
+            controllerMessageWrapper = createMessage(activities[2]);
+        }
+        controllerMessageWrapper.writeDelimitedTo(socket.getOutputStream());
+
+    }
+
+    public ControllerMessages.ControllerMessageWrapper createMessage(String activity){
+
+        ControllerMessages.ControllerMessageWrapper controllerMessageWrapper = null;
+        if(activity.toLowerCase().equals(activities[0])){
+            ControllerMessages.StorageRespond controllerRespond = ControllerMessages
+                    .StorageRespond.newBuilder()
+                    .setFileName(fileName)
+                    .setChunkNo(chunkNo.get(fileName))
+                    .setReplica(replica)
+                    .addAllActivenodes(getStorage().keySet())
+                    .addAllActiveNodesPort(getStorage().values())
+                    .build();
+
+           controllerMessageWrapper  = ControllerMessages
+                    .ControllerMessageWrapper.newBuilder()
+                    .setStorageResMsg(controllerRespond)
+                    .build();
+        }
+        else if(activity.toLowerCase().equals(activities[1])){
+            Map<String,Integer> map = getData(fileName);
+            ControllerMessages.RetrieveRespond retrieveRespond = ControllerMessages
+                    .RetrieveRespond
+                    .newBuilder()
+                    .setChunkNo(chunkNo.get(fileName))
+                    .setFileName(fileName)
+                    .addAllStorageNodes(map.keySet())
+                    .addAllStorageNodesPort(map.values())
+                    .build();
+
+            controllerMessageWrapper = ControllerMessages.ControllerMessageWrapper
+                    .newBuilder()
+                    .setRetrieveResMsg(retrieveRespond).build();
+        }
+        else{
+            ControllerMessages.SafeMode safeMode = ControllerMessages.SafeMode.newBuilder().setSafeMode("false").build();
+            controllerMessageWrapper = ControllerMessages.ControllerMessageWrapper.newBuilder().setSafeModeMsg(safeMode).build();
+        }
+
+        return controllerMessageWrapper;
+    }
+
+    private Map<String,Integer> getData(String fileName){
+        Map<String,Integer> map = new HashMap<>();
+        int countChunk = 0;
+        for (String hostname : storageNodeChunkReport.keySet()) {
+            List<String> chunkList = storageNodeChunkReport.get(hostname);
+            System.out.print(chunkList);
+            for(String chunk : chunkList){
+                if(chunk.contains(fileName)) {
+
+                    map.put(hostname,storageNodeList.get(hostname));
+                   countChunk++;
+                }
+            }
+        }
+        //chunkNo = countChunk/map.size();
+        return map;
+    }
+
+    private Map<String,Integer> getStorage(){
+        Map<String,Integer> map = new HashMap<>();
+
+        int i = 0;
+        for(String hostname : storageNodeList.keySet()){
+          if(i == replica){
+              break;
+          }
+          map.put(hostname,storageNodeList.get(hostname));
+          i++;
+      }
+        return map;
+    }
+
+    private void getHeartBeat(ControllerMessages.HeartBeat heartBeat) throws IOException {
+        if(heartBeat.getChunkListList().size()!=0 || !heartBeat.getChunkListList().isEmpty()){
+            if(heartBeat.getChunkListList().iterator().next().contains("+") || heartBeat.getChunkListList().iterator().next().contains("-")) {
+                LinkedList<String> strings = new LinkedList(storageNodeChunkReport.get(heartBeat.getHostName()));
+                for(int i = 0;i<heartBeat.getChunkListCount();i++){
+                    if (heartBeat.getChunkList(i).contains("+")) {
+                        strings.add(heartBeat.getChunkList(i).substring(1));
+                    } else if (heartBeat.getChunkList(i).contains("-")) {
+                       strings.remove(heartBeat.getChunkList(i).substring(1));
+                    }
+                }
+                storageNodeChunkReport.put(heartBeat.getHostName(),strings);
+            }
+            else {
+                storageNodeChunkReport.put(heartBeat.getHostName(),heartBeat.getChunkListList());
+            }
+        }
+        storageNodeList.put(heartBeat.getHostName(),heartBeat.getPort());
+        storageNodeFreeSpace.put(heartBeat.getHostName(), heartBeat.getFreeSpace());
+        activeNodes.put(heartBeat.getHostName(),new Date());
+
+    }
+
+    private static void detectNodeFailure(final Socket socket) throws IOException {
+        Timer timer = new Timer();
+        timer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                Date time = new Date();
+                Iterator<String> iterator = activeNodes.keySet().iterator();
+                while (iterator.hasNext()){
+                    String hostName = iterator.next();
+                    long diffSeconds = (time.getTime() - activeNodes.get(hostName).getTime()) / 1000 % 60;
+                    if (diffSeconds > 10) {
+                        try {
+                            System.out.println(hostName +"fail");
+                            test(hostName);
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                }
+            }
+        }, 0, 10000);
+    }
+
+    private static void maintainReplica(Socket socket, List<String> nodeFailureName) throws IOException {
+        Map<String, Integer> chunkinList = countChunkinList(nodeFailureName);
+        Map<String,Integer> storages = new HashMap<>();
+        String firstStorage = null;
+
+
+
+       for(String storageName : storageNodeChunkReport.keySet()){
+           for(String failChunk : chunkinList.keySet()){
+               if(storageNodeChunkReport.get(storageName).contains(failChunk)){
+                   storages.put(storageName,storageNodeList.get(storageName));
+                   firstStorage = storageName;
+               }
+           }
+       }
+        socket = new Socket(subString(firstStorage),storages.get(firstStorage));
+        StorageMessages.NodeFailure nodeFailure = StorageMessages
+                .NodeFailure.newBuilder()
+                .addAllChunkNameList(chunkinList.keySet())
+                .addAllChunkAmount(chunkinList.values())
+                .addAllStoreNodes(storages.keySet())
+                .addAllStoreNodesPort(storages.values())
+                .build();
+
+        StorageMessages.StorageMessageWrapper messageWrapper = StorageMessages.StorageMessageWrapper.
+                newBuilder().setNodeFailureMsg(nodeFailure).build();
+       messageWrapper.writeDelimitedTo(socket.getOutputStream());
+    }
+
+   private static void test(String hostname) throws IOException {
+        List<String> failChunks = new ArrayList<>();
+        failChunks.addAll(storageNodeChunkReport.get(hostname));
+        activeNodes.remove(hostname);
+        storageNodeChunkReport.remove(hostname);
+        storageNodeFreeSpace.remove(hostname);
+        storageNodeList.remove(hostname);
+       String hostName = null;
+       int port = 0;
+       List<String> destinies = new ArrayList<>();
+       List<Integer> destiniesPort = new ArrayList<>();
+
+       for(String storageName : storageNodeChunkReport.keySet()){
+         List<String> storedChunks = new ArrayList<>();
+           storedChunks.addAll(storageNodeChunkReport.get(storageName));
+              for(String failchunk : failChunks){
+                  if(storedChunks.contains(failchunk)){
+                      hostName = storageName;
+                      port = storageNodeList.get(storageName);
+                  }
+                  else{
+                      destinies.add(storageName);
+                      destiniesPort.add(storageNodeList.get(storageName));
+                  }
+              }
+
+           }
+
+       System.out.println(hostName);
+       System.out.println(port);
+
+        for(String name : failChunks) {
+            Socket socket = new Socket(hostName,port);
+            StorageMessages.NodeFailure nodeFailure = StorageMessages
+                    .NodeFailure.newBuilder()
+                    .addChunkNameList(name)
+                    .addChunkAmount(1)
+                    .addAllStoreNodes(destinies)
+                   .addAllStoreNodesPort(destiniesPort)
+                    .build();
+            StorageMessages.StorageMessageWrapper messageWrapper = StorageMessages.StorageMessageWrapper.
+                    newBuilder().setNodeFailureMsg(nodeFailure).build();
+            messageWrapper.writeDelimitedTo(socket.getOutputStream());
+            System.out.print(messageWrapper);
+        }
+   }
+
+    private static String subString(String hostname){
+        String arrOfStr = hostname.substring(0,25);
+        return arrOfStr;
+    }
+
+    private static Map<String,Integer> countChunkinList(List<String> chunks){
+        Set<String> uniqueSet = new HashSet<String>(chunks);
+        Map<String,Integer> map = new HashMap<>();
+        for (String temp : uniqueSet) {
+            map.put(temp,Collections.frequency(chunks, temp));
+        }
+        return map;
+    }
+
+    private static String getHostname()
+            throws UnknownHostException {
+        return InetAddress.getLocalHost().getHostName();
+    }
+
+}
+
+
